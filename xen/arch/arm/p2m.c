@@ -5,6 +5,9 @@
 #include <xen/errno.h>
 #include <xen/domain_page.h>
 #include <xen/bitops.h>
+#include <xen/mem_event.h>
+#include <xen/mem_access.h>
+#include <public/mem_event.h>
 #include <asm/flushtlb.h>
 #include <asm/gic.h>
 #include <asm/event.h>
@@ -414,12 +417,41 @@ static int p2m_create_table(struct domain *d, lpae_t *entry,
     return 0;
 }
 
+static int p2m_mem_access_radix_set(struct p2m_domain *p2m, unsigned long pfn,
+                                     p2m_access_t a)
+{
+    int rc;
+
+    if ( p2m_access_rwx == a )
+    {
+        if ( p2m->access_in_use )
+            radix_tree_delete(&p2m->mem_access_settings, pfn);
+
+        return 0;
+    }
+
+    rc = radix_tree_insert(&p2m->mem_access_settings, pfn,
+                           radix_tree_int_to_ptr(a));
+    if ( rc == -EEXIST )
+    {
+        /* If a setting existed already, change it to the new one */
+        radix_tree_replace_slot(
+            radix_tree_lookup_slot(
+                &p2m->mem_access_settings, pfn),
+            radix_tree_int_to_ptr(a));
+        rc = 0;
+    }
+
+    return rc;
+}
+
 enum p2m_operation {
     INSERT,
     ALLOCATE,
     REMOVE,
     RELINQUISH,
     CACHEFLUSH,
+    MEMACCESS,
 };
 
 /* Put any references on the single 4K page referenced by pte.  TODO:
@@ -553,13 +585,22 @@ static int apply_one_level(struct domain *d,
         if ( p2m_valid(orig_pte) )
             return P2M_ONE_DESCEND;
 
-        if ( is_mapping_aligned(*addr, end_gpaddr, 0, level_size) )
+        if ( is_mapping_aligned(*addr, end_gpaddr, 0, level_size) &&
+           /* We only create superpages when mem_access is not in use. */
+             (level == 3 || (level < 3 && !p2m->access_in_use)) )
         {
             struct page_info *page;
 
             page = alloc_domheap_pages(d, level_shift - PAGE_SHIFT, 0);
             if ( page )
             {
+                rc = p2m_mem_access_radix_set(p2m, paddr_to_pfn(*addr), a);
+                if ( rc < 0 )
+                {
+                    free_domheap_page(page);
+                    return rc;
+                }
+
                 pte = mfn_to_p2m_entry(page_to_mfn(page), mattr, t, a);
                 if ( level < 3 )
                     pte.p2m.table = 0;
@@ -580,8 +621,8 @@ static int apply_one_level(struct domain *d,
         /*
          * If we get here then we failed to allocate a sufficiently
          * large contiguous region for this level (which can't be
-         * L3). Create a page table and continue to descend so we try
-         * smaller allocations.
+         * L3) or mem_access is in use. Create a page table and
+         * continue to descend so we try smaller allocations.
          */
         rc = p2m_create_table(d, entry, 0, flush_cache);
         if ( rc < 0 )
@@ -591,9 +632,14 @@ static int apply_one_level(struct domain *d,
 
     case INSERT:
         if ( is_mapping_aligned(*addr, end_gpaddr, *maddr, level_size) &&
-           /* We do not handle replacing an existing table with a superpage */
-             (level == 3 || !p2m_table(orig_pte)) )
+           /* We do not handle replacing an existing table with a superpage
+            * or when mem_access is in use. */
+             (level == 3 || (!p2m_table(orig_pte) && !p2m->access_in_use)) )
         {
+            rc = p2m_mem_access_radix_set(p2m, paddr_to_pfn(*addr), a);
+            if ( rc < 0 )
+                return rc;
+
             /* New mapping is superpage aligned, make it */
             pte = mfn_to_p2m_entry(*maddr >> PAGE_SHIFT, mattr, t, a);
             if ( level < 3 )
@@ -709,6 +755,7 @@ static int apply_one_level(struct domain *d,
 
         memset(&pte, 0x00, sizeof(pte));
         p2m_write_pte(entry, pte, flush_cache);
+        p2m_mem_access_radix_set(p2m, paddr_to_pfn(*addr), p2m_access_rwx);
 
         *addr += level_size;
         *maddr += level_size;
@@ -753,6 +800,47 @@ static int apply_one_level(struct domain *d,
             *addr += PAGE_SIZE;
             return P2M_ONE_PROGRESS_NOP;
         }
+
+    case MEMACCESS:
+        if ( level < 3 )
+        {
+            if ( !p2m_valid(orig_pte) )
+            {
+                *addr += level_size;
+                return P2M_ONE_PROGRESS_NOP;
+            }
+
+            /* Shatter large pages as we descend */
+            if ( p2m_mapping(orig_pte) )
+            {
+                rc = p2m_shatter_page(d, entry, level, flush_cache);
+                if ( rc < 0 )
+                    return rc;
+            } /* else: an existing table mapping -> descend */
+
+            return P2M_ONE_DESCEND;
+        }
+        else
+        {
+            pte = orig_pte;
+
+            if ( !p2m_table(pte) )
+                pte.bits = 0;
+
+            if ( p2m_valid(pte) )
+            {
+                rc = p2m_mem_access_radix_set(p2m, paddr_to_pfn(*addr), a);
+                if ( rc < 0 )
+                    return rc;
+
+                p2m_set_permission(&pte, pte.p2m.type, a);
+                p2m_write_pte(entry, pte, flush_cache);
+            }
+
+            *addr += level_size;
+            *flush = true;
+            return P2M_ONE_PROGRESS;
+        }
     }
 
     BUG(); /* Should never get here */
@@ -776,6 +864,8 @@ static int apply_p2m_changes(struct domain *d,
     unsigned int cur_root_table = ~0;
     unsigned int cur_offset[4] = { ~0, };
     unsigned int count = 0;
+    const unsigned long sgfn = paddr_to_pfn(start_gpaddr),
+                        egfn = paddr_to_pfn(end_gpaddr);
     bool_t flush = false;
     bool_t flush_pt;
 
@@ -819,6 +909,22 @@ static int apply_p2m_changes(struct domain *d,
                 goto out;
             }
             count = 0;
+        }
+
+        /*
+         * Preempt setting mem_access permissions as required by XSA-89,
+         * if it's not the last iteration.
+         */
+        if ( op == MEMACCESS && count )
+        {
+            uint32_t progress = paddr_to_pfn(addr) - sgfn + 1;
+
+            if ( (egfn - sgfn) > progress && !(progress & mask)
+                 && hypercall_preempt_check() )
+            {
+                rc = progress;
+                goto out;
+            }
         }
 
         if ( P2M_ROOT_PAGES > 1 )
@@ -884,20 +990,8 @@ static int apply_p2m_changes(struct domain *d,
         }
     }
 
-    if ( flush )
-    {
-        unsigned long sgfn = paddr_to_pfn(start_gpaddr);
-        unsigned long egfn = paddr_to_pfn(end_gpaddr);
-
-        flush_tlb_domain(d);
-        iommu_iotlb_flush(d, sgfn, egfn - sgfn);
-    }
-
     if ( op == ALLOCATE || op == INSERT )
     {
-        unsigned long sgfn = paddr_to_pfn(start_gpaddr);
-        unsigned long egfn = paddr_to_pfn(end_gpaddr);
-
         p2m->max_mapped_gfn = max(p2m->max_mapped_gfn, egfn);
         p2m->lowest_mapped_gfn = min(p2m->lowest_mapped_gfn, sgfn);
     }
@@ -905,6 +999,12 @@ static int apply_p2m_changes(struct domain *d,
     rc = 0;
 
 out:
+    if ( flush )
+    {
+        flush_tlb_domain(d);
+        iommu_iotlb_flush(d, sgfn, egfn - sgfn);
+    }
+
     if ( rc < 0 && ( op == INSERT || op == ALLOCATE ) &&
          addr != start_gpaddr )
     {
@@ -1282,6 +1382,254 @@ void __init setup_virt_paging(void)
     BUG_ON( P2M_ROOT_LEVEL == 0 && P2M_ROOT_ORDER > 0 );
     setup_virt_paging_one((void *)val);
     smp_call_function(setup_virt_paging_one, (void *)val, 1);
+}
+
+bool_t p2m_mem_access_check(paddr_t gpa, vaddr_t gla, const struct npfec npfec)
+{
+    int rc;
+    bool_t violation;
+    xenmem_access_t xma;
+    mem_event_request_t *req;
+    struct vcpu *v = current;
+    struct p2m_domain *p2m = p2m_get_hostp2m(v->domain);
+
+    /* Mem_access is not in use. */
+    if ( !p2m->access_in_use )
+        return true;
+
+    rc = p2m_get_mem_access(v->domain, paddr_to_pfn(gpa), &xma);
+    if ( rc )
+        return true;
+
+    /* Now check for mem_access violation. */
+    switch ( xma )
+    {
+    case XENMEM_access_rwx:
+        violation = false;
+        break;
+    case XENMEM_access_rw:
+        violation = npfec.insn_fetch;
+        break;
+    case XENMEM_access_wx:
+        violation = npfec.read_access;
+        break;
+    case XENMEM_access_rx:
+    case XENMEM_access_rx2rw:
+        violation = npfec.write_access;
+        break;
+    case XENMEM_access_x:
+        violation = npfec.read_access || npfec.write_access;
+        break;
+    case XENMEM_access_w:
+        violation = npfec.read_access || npfec.insn_fetch;
+        break;
+    case XENMEM_access_r:
+        violation = npfec.write_access || npfec.insn_fetch;
+        break;
+    default:
+    case XENMEM_access_n:
+    case XENMEM_access_n2rwx:
+        violation = true;
+        break;
+    }
+
+    if ( !violation )
+        return true;
+
+    /* First, handle rx2rw and n2rwx conversion automatically. */
+    if ( npfec.write_access && xma == XENMEM_access_rx2rw )
+    {
+        rc = p2m_set_mem_access(v->domain, paddr_to_pfn(gpa), 1,
+                                0, ~0, XENMEM_access_rw);
+        return false;
+    }
+    else if ( xma == XENMEM_access_n2rwx )
+    {
+        rc = p2m_set_mem_access(v->domain, paddr_to_pfn(gpa), 1,
+                                0, ~0, XENMEM_access_rwx);
+    }
+
+    /* Otherwise, check if there is a memory event listener, and send the message along */
+    if ( !mem_event_check_ring(&v->domain->mem_event->access) )
+    {
+        /* No listener */
+        if ( p2m->access_required )
+        {
+            gdprintk(XENLOG_INFO, "Memory access permissions failure, "
+                                  "no mem_event listener VCPU %d, dom %d\n",
+                                  v->vcpu_id, v->domain->domain_id);
+            domain_crash(v->domain);
+        }
+        else
+        {
+            /* n2rwx was already handled */
+            if ( xma != XENMEM_access_n2rwx )
+            {
+                /* A listener is not required, so clear the access
+                 * restrictions. */
+                rc = p2m_set_mem_access(v->domain, paddr_to_pfn(gpa), 1,
+                                        0, ~0, XENMEM_access_rwx);
+            }
+        }
+
+        /* No need to reinject */
+        return false;
+    }
+
+    req = xzalloc(mem_event_request_t);
+    if ( req )
+    {
+        req->reason = MEM_EVENT_REASON_VIOLATION;
+        if ( xma != XENMEM_access_n2rwx )
+            req->flags |= MEM_EVENT_FLAG_VCPU_PAUSED;
+        req->gfn = gpa >> PAGE_SHIFT;
+        req->offset =  gpa & ((1 << PAGE_SHIFT) - 1);
+        req->gla = gla;
+        req->gla_valid = npfec.gla_valid;
+        req->access_r = npfec.read_access;
+        req->access_w = npfec.write_access;
+        req->access_x = npfec.insn_fetch;
+        if ( npfec_kind_in_gpt == npfec.kind )
+            req->fault_in_gpt = 1;
+        if ( npfec_kind_with_gla == npfec.kind )
+            req->fault_with_gla = 1;
+        req->vcpu_id = v->vcpu_id;
+
+        mem_access_send_req(v->domain, req);
+        xfree(req);
+    }
+
+    /* Pause the current VCPU */
+    if ( xma != XENMEM_access_n2rwx )
+        mem_event_vcpu_pause(v);
+
+    return false;
+}
+
+/* Set access type for a region of pfns.
+ * If start_pfn == -1ul, sets the default access type */
+long p2m_set_mem_access(struct domain *d, unsigned long pfn, uint32_t nr,
+                        uint32_t start, uint32_t mask, xenmem_access_t access)
+{
+    struct p2m_domain *p2m = p2m_get_hostp2m(d);
+    p2m_access_t a;
+    long rc = 0;
+
+    static const p2m_access_t memaccess[] = {
+#define ACCESS(ac) [XENMEM_access_##ac] = p2m_access_##ac
+        ACCESS(n),
+        ACCESS(r),
+        ACCESS(w),
+        ACCESS(rw),
+        ACCESS(x),
+        ACCESS(rx),
+        ACCESS(wx),
+        ACCESS(rwx),
+        ACCESS(rx2rw),
+        ACCESS(n2rwx),
+#undef ACCESS
+    };
+
+    switch ( access )
+    {
+    case 0 ... ARRAY_SIZE(memaccess) - 1:
+        a = memaccess[access];
+        break;
+    case XENMEM_access_default:
+        a = p2m->default_access;
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    /*
+     * Flip access_in_use to true when a permission is set, as to prevent
+     * allocating or inserting super-pages.
+     */
+    p2m->access_in_use = true;
+
+    /* If request to set default access. */
+    if ( pfn == ~0ul )
+    {
+        p2m->default_access = a;
+        return 0;
+    }
+
+    rc = apply_p2m_changes(d, MEMACCESS,
+                           pfn_to_paddr(pfn+start), pfn_to_paddr(pfn+nr),
+                           0, MATTR_MEM, mask, 0, a);
+    if ( rc < 0 )
+        return rc;
+    else if ( rc > 0 )
+        return start + rc;
+
+    return 0;
+}
+
+int p2m_get_mem_access(struct domain *d, unsigned long gpfn,
+                       xenmem_access_t *access)
+{
+    struct p2m_domain *p2m = p2m_get_hostp2m(d);
+    void *i;
+    unsigned int index;
+
+    static const xenmem_access_t memaccess[] = {
+#define ACCESS(ac) [p2m_access_##ac] = XENMEM_access_##ac
+            ACCESS(n),
+            ACCESS(r),
+            ACCESS(w),
+            ACCESS(rw),
+            ACCESS(x),
+            ACCESS(rx),
+            ACCESS(wx),
+            ACCESS(rwx),
+            ACCESS(rx2rw),
+            ACCESS(n2rwx),
+#undef ACCESS
+    };
+
+    /* If no setting was ever set, just return rwx. */
+    if ( !p2m->access_in_use )
+    {
+        *access = XENMEM_access_rwx;
+        return 0;
+    }
+
+    /* If request to get default access */
+    if ( gpfn == ~0ull )
+    {
+        *access = memaccess[p2m->default_access];
+        return 0;
+    }
+
+    spin_lock(&p2m->lock);
+    i = radix_tree_lookup(&p2m->mem_access_settings, gpfn);
+    spin_unlock(&p2m->lock);
+
+    if ( !i )
+    {
+        /*
+         * No setting was found in the Radix tree. Check if the
+         * entry exists in the page-tables.
+         */
+        paddr_t maddr = p2m_lookup(d, gpfn << PAGE_SHIFT, NULL);
+        if ( INVALID_PADDR == maddr )
+            return -ESRCH;
+
+        /* If entry exists then its rwx. */
+        *access = XENMEM_access_rwx;
+    }
+    else
+    {
+        /* Setting was found in the Radix tree. */
+        index = radix_tree_ptr_to_int(i);
+        if ( index >= ARRAY_SIZE(memaccess) )
+            return -ERANGE;
+
+        *access = memaccess[index];
+    }
+
+    return 0;
 }
 
 /*
