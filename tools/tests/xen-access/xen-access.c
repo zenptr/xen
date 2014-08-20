@@ -41,22 +41,16 @@
 #include <xenctrl.h>
 #include <xen/mem_event.h>
 
-#define DPRINTF(a, b...) fprintf(stderr, a, ## b)
-#define ERROR(a, b...) fprintf(stderr, a "\n", ## b)
-#define PERROR(a, b...) fprintf(stderr, a ": %s\n", ## b, strerror(errno))
+#if defined(__i386__) || defined(__x86_64__)
 
-/* Spinlock and mem event definitions */
-
-#define SPIN_LOCK_UNLOCKED 0
-
+#define START_PFN 0ULL
 #define ADDR (*(volatile long *) addr)
+
 /**
  * test_and_set_bit - Set a bit and return its old value
  * @nr: Bit to set
  * @addr: Address to count from
  *
- * This operation is atomic and cannot be reordered.
- * It also implies a memory barrier.
  */
 static inline int test_and_set_bit(int nr, volatile void *addr)
 {
@@ -68,6 +62,43 @@ static inline int test_and_set_bit(int nr, volatile void *addr)
         : "Ir" (nr), "m" (ADDR) : "memory");
     return oldbit;
 }
+
+#elif defined(__arm__) || defined(__aarch64__)
+
+#include <xen/arch-arm.h>
+
+#define PAGE_SHIFT              12
+#define START_PFN               (GUEST_RAM0_BASE >> PAGE_SHIFT)
+#define BITS_PER_WORD           32
+#define BIT_MASK(nr)            (1UL << ((nr) % BITS_PER_WORD))
+#define BIT_WORD(nr)            ((nr) / BITS_PER_WORD)
+
+/**
+ * test_and_set_bit - Set a bit and return its old value
+ * @nr: Bit to set
+ * @addr: Address to count from
+ *
+ */
+static inline int test_and_set_bit(int nr, volatile void *addr)
+{
+        unsigned int mask = BIT_MASK(nr);
+        volatile unsigned int *p =
+                ((volatile unsigned int *)addr) + BIT_WORD(nr);
+        unsigned int old = *p;
+
+        *p = old | mask;
+        return (old & mask) != 0;
+}
+
+#endif
+
+#define DPRINTF(a, b...) fprintf(stderr, a, ## b)
+#define ERROR(a, b...) fprintf(stderr, a "\n", ## b)
+#define PERROR(a, b...) fprintf(stderr, a ": %s\n", ## b, strerror(errno))
+
+/* Spinlock and mem event definitions */
+
+#define SPIN_LOCK_UNLOCKED 0
 
 typedef int spinlock_t;
 
@@ -108,7 +139,7 @@ typedef struct mem_event {
 typedef struct xenaccess {
     xc_interface *xc_handle;
 
-    xc_domaininfo_t    *domain_info;
+    int max_gpfn;
 
     mem_event_t mem_event;
 } xenaccess_t;
@@ -212,7 +243,6 @@ int xenaccess_teardown(xc_interface *xch, xenaccess_t *xenaccess)
     }
     xenaccess->xc_handle = NULL;
 
-    free(xenaccess->domain_info);
     free(xenaccess);
 
     return 0;
@@ -293,23 +323,17 @@ xenaccess_t *xenaccess_init(xc_interface **xch_r, domid_t domain_id)
                    (mem_event_sring_t *)xenaccess->mem_event.ring_page,
                    XC_PAGE_SIZE);
 
-    /* Get domaininfo */
-    xenaccess->domain_info = malloc(sizeof(xc_domaininfo_t));
-    if ( xenaccess->domain_info == NULL )
+    /* Get max_gpfn */
+    xenaccess->max_gpfn = xc_domain_maximum_gpfn(xenaccess->xc_handle,
+                                                 xenaccess->mem_event.domain_id);
+
+    if ( xenaccess->max_gpfn < 0 )
     {
-        ERROR("Error allocating memory for domain info");
+        ERROR("Failed to get max gpfn");
         goto err;
     }
 
-    rc = xc_domain_getinfolist(xenaccess->xc_handle, domain_id, 1,
-                               xenaccess->domain_info);
-    if ( rc != 1 )
-    {
-        ERROR("Error getting domain info");
-        goto err;
-    }
-
-    DPRINTF("max_pages = %"PRIx64"\n", xenaccess->domain_info->max_pages);
+    DPRINTF("max_gpfn = %"PRIx32"\n", xenaccess->max_gpfn);
 
     return xenaccess;
 
@@ -492,8 +516,9 @@ int main(int argc, char *argv[])
         goto exit;
     }
 
-    rc = xc_set_mem_access(xch, domain_id, default_access, 0,
-                           xenaccess->domain_info->max_pages);
+    rc = xc_set_mem_access(xch, domain_id, default_access, START_PFN,
+                           (xenaccess->max_gpfn - START_PFN) );
+
     if ( rc < 0 )
     {
         ERROR("Error %d setting all memory to access type %d\n", rc,
@@ -520,8 +545,8 @@ int main(int argc, char *argv[])
 
             /* Unregister for every event */
             rc = xc_set_mem_access(xch, domain_id, XENMEM_access_rwx, ~0ull, 0);
-            rc = xc_set_mem_access(xch, domain_id, XENMEM_access_rwx, 0,
-                                   xenaccess->domain_info->max_pages);
+            rc = xc_set_mem_access(xch, domain_id, XENMEM_access_rwx, START_PFN,
+                                   (xenaccess->max_gpfn - START_PFN) );
             rc = xc_hvm_param_set(xch, domain_id, HVM_PARAM_MEMORY_EVENT_INT3, HVMPME_mode_disabled);
 
             shutting_down = 1;
