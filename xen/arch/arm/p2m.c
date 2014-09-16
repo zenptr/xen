@@ -335,8 +335,7 @@ static lpae_t mfn_to_p2m_entry(unsigned long mfn, unsigned int mattr,
         break;
     }
 
-    /* We pass p2m_access_rwx as a placeholder for now. */
-    p2m_set_permission(&e, t, p2m_access_rwx);
+    p2m_set_permission(&e, t, a);
 
     ASSERT(!(pa & ~PAGE_MASK));
     ASSERT(!(pa & ~PADDR_MASK));
